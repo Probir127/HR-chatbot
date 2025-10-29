@@ -19,7 +19,7 @@ except Exception:
 load_dotenv()
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:latest")
 EMPLOYEE_JSON_PATH = os.getenv("EMPLOYEE_JSON_PATH", "data/employees.json")
 INDEX_PATH = os.getenv("INDEX_PATH", "vectorstores/db_faiss/index.faiss")
 TEXTS_PATH = os.getenv("TEXTS_PATH", "vectorstores/db_faiss/texts.npy")
@@ -209,3 +209,4 @@ if __name__ == "__main__":
         if q.lower() in ("exit","quit"):
             break
         print("Bot:", handle_hr_query(q))
+
