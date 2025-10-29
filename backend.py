@@ -60,14 +60,18 @@ def contains_bangla(text: str) -> bool:
     return any("\u0980" <= ch <= "\u09FF" for ch in text)
 
 def is_probable_banglish(text: str) -> bool:
-    # lightweight romanized bangla heuristic (only when many roman tokens)
+    # stricter romanized bangla heuristic — require at least 2 token matches
     tokens = re.findall(r"\b[a-zA-Z]+\b", text)
     if len(tokens) < 2:
         return False
-    banglish_patterns = [r"kemon|bhalo|ami|tumi|kore|hobe|ache|kothay|khobor"]
+    banglish_patterns = [
+        r"\bkemon\b", r"\bbhalo\b", r"\bami\b", r"\btumi\b", r"\bache\b",
+        r"\bhobe\b", r"\bkorbo\b", r"\bekhane\b", r"\bbhalo?\b", r"\btomar\b",
+        r"\bamar\b", r"\bbujh\b", r"\bki\b"
+    ]
     text_l = text.lower()
-    count = sum(1 for p in banglish_patterns if re.search(r"\b"+p+r"\b", text_l))
-    return count >= 1
+    matches = sum(1 for p in banglish_patterns if re.search(p, text_l))
+    return matches >= 2
 
 def extract_person_name_simple(text: str):
     """Very small, dependency-free name heuristic:
@@ -157,12 +161,31 @@ def call_ollama_threaded(system_prompt, user_prompt, temperature=0.4, max_tokens
     return out[0] if out else "⚠️ No response."
 
 # --- Chain-of-thought style system prompt (hidden reasoning) ---
-def build_system_prompt(lang_label):
+def build_system_prompt(lang_label, source_label: str = "HR knowledge base"):
+    if lang_label == "bn":
+        lang_instruction = "Reply in Bangla (বাংলা ভাষায় উত্তর দিন)."
+        example_note = "উত্তরটি বাংলা লিপিতে লিখুন।"
+    elif lang_label == "banglish":
+        lang_instruction = "Reply in Banglish (Romanized Bangla, e.g., 'Tumi kemon aso?')."
+        example_note = "উত্তরটি রোমান অক্ষরে দিন — বাংলা লিপি ব্যবহার করবেন না."
+    else:
+        lang_instruction = "Reply in English."
+        example_note = "Answer in clear, natural English."
+
     return f"""
 You are HR Chatbot — a helpful HR assistant for the company.
 Before answering, think step-by-step internally: (1) understand the user intent, (2) use the provided context, (3) produce a concise final answer.
 Do NOT reveal internal steps. Output only the final answer in the user's language: {lang_label}.
 Keep replies short (1–3 sentences), friendly, and professional.
+if the user greets you, greet them back politely.
+Use the following context from the {source_label} to answer user queries.   
+If the context does not contain the answer, respond with:"⚠️ I couldn't find that in HR policies. Please contact HR for details."
+Include relevant details from the context in your answer.
+{lang_instruction}
+
+{example_note}
+
+Use only the provided context and employees.json. If information is missing, reply: "I'm sorry — I don't have that information. Please contact HR."
 """
 
 # --- Main public API: handle query ---
@@ -172,7 +195,7 @@ def handle_hr_query(user_input: str, session_id: str = None):
     if contains_bangla(user_input):
         lang = "bn"
     elif is_probable_banglish(user_input):
-        lang = "bn"   # treat as bangla if strong romanized signal
+        lang = "banglish"   # <-- changed: treat romanized as 'banglish'
     else:
         lang = "en"
 
@@ -190,7 +213,7 @@ def handle_hr_query(user_input: str, session_id: str = None):
         return "⚠️ I couldn't find that in HR policies. Please contact HR for details."
 
     # 4) build prompts and call model
-    system_prompt = build_system_prompt("Bangla" if lang=="bn" else "English")
+    system_prompt = build_system_prompt(lang)  # pass the label directly
     # encourage internal step-by-step reasoning but show only final
     user_prompt = f"Context:\n{context}\n\nUser question: {user_input}\n\nPlease answer concisely."
 
@@ -209,4 +232,3 @@ if __name__ == "__main__":
         if q.lower() in ("exit","quit"):
             break
         print("Bot:", handle_hr_query(q))
-
