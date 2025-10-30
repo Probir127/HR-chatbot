@@ -6,6 +6,7 @@ from typing import List, Optional
 import backend
 import os, json, hashlib, secrets
 from datetime import datetime, timedelta
+import threading # <-- ADDED: For thread-safety
 
 app = FastAPI(title="HR Chatbot API")
 
@@ -16,6 +17,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- THREAD SAFETY LOCKS ---
+USER_LOCK = threading.Lock()
+SESSION_LOCK = threading.Lock()
+CONTEXT_LOCK = threading.Lock()
+# --------------------------
 
 # --- User Models ---
 class UserRegister(BaseModel):
@@ -62,12 +69,22 @@ def hash_password(password: str) -> str:
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return hash_password(plain_password) == hashed_password
 
-# --- User Management ---
-def load_users(): return load_json(USERS_FILE, [])
-def save_users(users): save_json(USERS_FILE, users)
+# --- User Management (Protected with Locks) ---
+def load_users():
+    with USER_LOCK: # <-- ADDED: Lock for file I/O safety
+        return load_json(USERS_FILE, [])
 
-def load_sessions(): return load_json(SESSIONS_FILE, {})
-def save_sessions(sessions): save_json(SESSIONS_FILE, sessions)
+def save_users(users):
+    with USER_LOCK: # <-- ADDED: Lock for file I/O safety
+        save_json(USERS_FILE, users)
+
+def load_sessions(): 
+    with SESSION_LOCK: # <-- ADDED: Lock for file I/O safety
+        return load_json(SESSIONS_FILE, {})
+
+def save_sessions(sessions):
+    with SESSION_LOCK: # <-- ADDED: Lock for file I/O safety
+        save_json(SESSIONS_FILE, sessions)
 
 def create_session(user_id: str) -> str:
     sessions = load_sessions()
@@ -86,12 +103,13 @@ def verify_session(token: str) -> Optional[str]:
         return None
     session = sessions[token]
     if datetime.now() > datetime.fromisoformat(session["expires_at"]):
-        del sessions[token]
-        save_sessions(sessions)
+        with SESSION_LOCK: # <-- ADDED: Lock before modification
+            del sessions[token]
+            save_sessions(sessions)
         return None
     return session["user_id"]
 
-# --- In-Memory Short-Term Context Cache ---
+# --- In-Memory Short-Term Context Cache (Protected with Lock) ---
 SESSION_CONTEXTS = {}
 CONTEXT_EXPIRY_MINUTES = 10
 MAX_CONTEXT_MESSAGES = 3
@@ -99,22 +117,24 @@ MAX_CONTEXT_MESSAGES = 3
 def update_session_context(session_id: str, role: str, message: str):
     """Stores short-term conversational context per session."""
     now = datetime.now()
-    if session_id not in SESSION_CONTEXTS:
-        SESSION_CONTEXTS[session_id] = {"messages": [], "last_active": now}
-    ctx = SESSION_CONTEXTS[session_id]
-    ctx["messages"].append({"role": role, "content": message})
-    ctx["messages"] = ctx["messages"][-MAX_CONTEXT_MESSAGES:]  # keep last few
-    ctx["last_active"] = now
+    with CONTEXT_LOCK: # <-- ADDED: Lock for thread-safe access
+        if session_id not in SESSION_CONTEXTS:
+            SESSION_CONTEXTS[session_id] = {"messages": [], "last_active": now}
+        ctx = SESSION_CONTEXTS[session_id]
+        ctx["messages"].append({"role": role, "content": message})
+        ctx["messages"] = ctx["messages"][-MAX_CONTEXT_MESSAGES:]  # keep last few
+        ctx["last_active"] = now
 
 def get_recent_context(session_id: str):
     """Return recent messages if session still active."""
-    ctx = SESSION_CONTEXTS.get(session_id)
-    if not ctx:
-        return []
-    if datetime.now() - ctx["last_active"] > timedelta(minutes=CONTEXT_EXPIRY_MINUTES):
-        del SESSION_CONTEXTS[session_id]
-        return []
-    return ctx["messages"]
+    with CONTEXT_LOCK: # <-- ADDED: Lock for thread-safe access
+        ctx = SESSION_CONTEXTS.get(session_id)
+        if not ctx:
+            return []
+        if datetime.now() - ctx["last_active"] > timedelta(minutes=CONTEXT_EXPIRY_MINUTES):
+            del SESSION_CONTEXTS[session_id]
+            return []
+        return ctx["messages"]
 
 # --- Authentication Endpoints ---
 @app.post("/register")
@@ -157,6 +177,7 @@ async def login(login_data: UserLogin):
 async def logout(token: str):
     sessions = load_sessions()
     if token in sessions:
+        # Note: save_sessions is already protected by SESSION_LOCK in this updated file
         del sessions[token]
         save_sessions(sessions)
     return {"status": "success", "message": "Logout successful"}
@@ -191,6 +212,8 @@ async def chat_endpoint(request: ChatRequest):
         combined_history = recent_context + [{"role": "user", "content": request.message}]
 
         # Generate reply
+        # backend.ask_hr_bot is a synchronous operation now (updated in backend.py)
+        # FastAPI/Uvicorn handles this by running it in a thread pool, preventing blocking of the main event loop.
         reply = backend.ask_hr_bot(user_input=request.message, chat_history=combined_history, session_id=session_id)
 
         # Store this exchange for next query
