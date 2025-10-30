@@ -2,10 +2,10 @@
 import os
 import re
 import json
-import threading
+import threading 
 import requests
-from uuid import uuid4
 from dotenv import load_dotenv
+from typing import List, Dict, Optional # Added for clarity
 
 # --- NEW IMPORT: Use external prompt configuration ---
 import prompt_config 
@@ -48,7 +48,8 @@ if HAS_FAISS and os.path.exists(INDEX_PATH) and os.path.exists(TEXTS_PATH):
     try:
         index = faiss.read_index(INDEX_PATH)
         texts = np.load(TEXTS_PATH, allow_pickle=True)
-        embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+        # Optimization: Default SentenceTransformer model loading is often efficient enough
+        embedding_model = SentenceTransformer("all-MiniLM-L6-v2") 
         print(f"✅ FAISS knowledge base loaded ({len(texts)} entries)")
     except Exception as e:
         print(f"⚠️ Could not load FAISS index: {e}")
@@ -89,6 +90,33 @@ def extract_person_name_simple(text: str):
         return caps[0].strip()
     return None
 
+# --- NEW: Simple Intent Classification for better prompt guidance ---
+def simple_intent_classifier(text: str) -> str:
+    text_l = text.lower().strip()
+    
+    # 1. Identity / Greeting
+    if any(phrase in text_l for phrase in ["who are you", "what can you do", "hello", "hi", "salam", "kemon achen"]):
+        return "greeting"
+    
+    # 2. Employee Lookup (already done by name extraction, but good to check)
+    if any(phrase in text_l for phrase in ["who is", "who's", "details of", "contact for"]):
+        return "employee_lookup"
+
+    # 3. Salary & Benefits
+    if any(word in text_l for word in ["salary", "paycheck", "bonus", "increment", "pf", "allowance", "benefits", "loss hour", "deduction"]):
+        return "salary_benefits"
+        
+    # 4. Procedure / How-To (Resignation, leave, onboarding steps)
+    if any(word in text_l for word in ["how to", "procedure", "process for", "resign", "apply for leave", "onboarding", "how can i"]):
+        return "procedure_howto"
+        
+    # 5. Office Logistics / Rules
+    if any(word in text_l for word in ["office time", "address", "washroom", "kitchen", "AC", "rules for", "dress code", "emergency", "facilities"]):
+        return "office_logistics"
+
+    # 6. Default to Policy Question
+    return "policy_question"
+
 def get_employee_by_name(name: str):
     if not name: return None
     name_l = name.lower().strip()
@@ -100,6 +128,7 @@ def get_employee_by_name(name: str):
 def format_employee(emp):
     if not emp:
         return "❌ Employee not found in HR records."
+    # Matches the required format in prompt_config's Rule 5/Example
     return (
         f"👤 {emp.get('name','N/A')}\n"
         f"🏢 Position: {emp.get('position','N/A')}\n"
@@ -123,11 +152,12 @@ def search_knowledge_base(query, top_k=3):
     score = results[0][1]
     return ctx, score
 
-# --- Ollama (thread-safe wrapper) ---
+# --- Ollama (synchronous call for performance) ---
 def call_ollama(payload_json, timeout=60):
     try:
         url = f"{OLLAMA_BASE_URL}/api/chat"
-        r = requests.post(url, json=payload_json, timeout=timeout)
+        # Using requests.post synchronously, relying on FastAPI/Uvicorn to handle concurrency
+        r = requests.post(url, json=payload_json, timeout=timeout) 
         if r.status_code == 404:
             # some older ollama versions use /api/generate
             url = f"{OLLAMA_BASE_URL}/api/generate"
@@ -138,82 +168,111 @@ def call_ollama(payload_json, timeout=60):
         print("❌ Ollama call failed:", e)
         return {"error": str(e)}
 
-def call_ollama_threaded(system_prompt, user_prompt, temperature=0.4, max_tokens=300):
-    out = []
-    def worker():
-        payload = {
-            "model": OLLAMA_MODEL,
-            "messages": [
-                {"role":"system", "content": system_prompt},
-                {"role":"user", "content": user_prompt}
-            ],
-            "stream": False,
-            "options": {"temperature": temperature, "num_predict": max_tokens}
-        }
-        resp = call_ollama(payload)
-        # prefer message.content if present
-        if isinstance(resp, dict) and "message" in resp and isinstance(resp["message"], dict):
-            out.append(resp["message"].get("content","").strip())
-        elif isinstance(resp, dict) and "response" in resp:
-            out.append(str(resp.get("response","")).strip())
-        else:
-            out.append(str(resp))
-    t = threading.Thread(target=worker)
-    t.start()
-    t.join()
-    return out[0] if out else "⚠️ No response."
-
-# --- The local build_system_prompt has been moved to prompt_config.py ---
-# --- The original function definition is commented out/removed for clarity ---
-# def build_system_prompt(lang_label, source_label: str = "HR knowledge base"):
-#     # ... (original implementation)
-#     pass
+def call_ollama_synchronous(system_prompt: str, messages_history: List[Dict], temperature=0.4, max_tokens=300):
+    """
+    Synchronous blocking call to Ollama that sends the entire message history.
+    """
+    # Construct the full messages payload including system prompt
+    messages_payload = [{"role": "system", "content": system_prompt}] + messages_history 
+    
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": messages_payload, # <-- MODIFIED: Use the full message history
+        "stream": False,
+        "options": {"temperature": temperature, "num_predict": max_tokens}
+    }
+    resp = call_ollama(payload)
+    
+    # prefer message.content if present
+    if isinstance(resp, dict) and "message" in resp and isinstance(resp["message"], dict):
+        return resp["message"].get("content","").strip()
+    elif isinstance(resp, dict) and "response" in resp:
+        return str(resp.get("response","")).strip()
+    else:
+        return str(resp) if resp else "⚠️ No response."
 
 
 # --- Main public API: handle query ---
-def handle_hr_query(user_input: str, session_id: str = None):
-    # 1) language detection (strict)
+def handle_hr_query(user_input: str, chat_history: Optional[List[Dict]] = None, session_id: str = None):
+    chat_history = chat_history or []
     user_input = (user_input or "").strip()
+    
+    # 1) language detection (strict)
     if contains_bangla(user_input):
         lang = "bn"
     elif is_probable_banglish(user_input):
-        lang = "banglish"   # <-- changed: treat romanized as 'banglish'
+        lang = "banglish"
     else:
         lang = "en"
+        
+    # 2) Intent Classification (for prompt selection)
+    intent = simple_intent_classifier(user_input)
 
-    # 2) employee lookup only when name present
+    # 3) Immediate Employee Lookup (Bypasses LLM - Fastest Path)
     name = extract_person_name_simple(user_input)
     if name:
         emp = get_employee_by_name(name)
         if emp:
+            # Employee info found: return formatted static response immediately
             return format_employee(emp)
+        elif intent == "employee_lookup":
+            # If explicit lookup failed, fallback static message to save LLM call
+            return "❌ Employee not found in HR records."
 
-    # 3) search knowledge base
+
+    # 4) Search knowledge base
     context, score = search_knowledge_base(user_input)
-    if not context:
-        # fallback short answer
-        # Use a more explicit fallback from the config or a hardcoded one if no context
-        return "⚠️ I couldn't find that in HR policies. Please contact HR for details."
-
-    # 4) build prompts and call model
-    # Use the external get_system_prompt from prompt_config.py
-    system_prompt = prompt_config.get_system_prompt(language=lang) 
     
-    # encourage internal step-by-step reasoning but show only final
-    user_prompt = f"Context:\n{context}\n\nUser question: {user_input}\n\nPlease answer concisely."
+    # 5) Handle Missing Context
+    # If no context found AND not a simple greeting (which needs no KB)
+    if not context and intent not in ["greeting"]:
+        # Static fallback aligned with prompt_config rule 1
+        return "⚠️ I couldn't find that in HR policies. Please contact HR at people@acmeai.tech for details."
 
-    reply = call_ollama_threaded(system_prompt, user_prompt)
+    # 6) Build prompts and call model
+    
+    system_prompt = prompt_config.get_system_prompt(language=lang, context_type=intent) 
+    
+    messages_for_llm = []
+    
+    # Separate the current user message from the rest of the history
+    current_user_message = chat_history[-1]["content"] if chat_history else user_input
+    previous_history = chat_history[:-1] if chat_history else []
+    
+    # Add previous conversation messages (retains turns for context/memory)
+    messages_for_llm.extend(previous_history)
+    
+    # Prepend RAG context to the *current* user message's content
+    if context:
+        rag_prefix = f"Context from HR Knowledge Base:\n{context}\n\n"
+        current_user_message = rag_prefix + current_user_message
+    
+    # Add the (now potentially context-prefixed) current user message
+    messages_for_llm.append({"role": "user", "content": current_user_message})
+
+    # Add instruction on how to reply
+    messages_for_llm.append({"role": "user", "content": "Please answer concisely. Do not invent facts."})
+
+
+    reply = call_ollama_synchronous(system_prompt, messages_for_llm)
     return reply
 
 # Backwards-compatibility alias used by api_server.py
 def ask_hr_bot(user_input, chat_history=None, session_id=None):
-    return handle_hr_query(user_input, session_id=session_id)
+    # Pass the full chat_history object (list of {"role": str, "content": str})
+    return handle_hr_query(user_input, chat_history=chat_history, session_id=session_id)
 
 # Simple command-line debug
 if __name__ == "__main__":
     print("HR backend running (debug). Type 'exit' to quit.")
     while True:
         q = input("You: ").strip()
+        # For debug, we simulate a small history based on the previous query
+        # This is a basic simulation and may not perfectly reflect the API server's context window logic
+        simulated_history = []
+        if 'q' in locals() and q.lower() not in ("exit", "quit"):
+            simulated_history = [{"role": "user", "content": q}, {"role": "assistant", "content": "Bot simulated previous reply."}]
+        
         if q.lower() in ("exit","quit"):
             break
-        print("Bot:", handle_hr_query(q))
+        print("Bot:", ask_hr_bot(q, chat_history=simulated_history))
