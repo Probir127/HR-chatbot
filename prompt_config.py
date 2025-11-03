@@ -1,29 +1,180 @@
 """
-prompt_config.py - Production-Grade Chain-of-Thought Prompt Configuration
-===========================================================================
+prompt_config.py - Production-Grade Prompt Configuration with Predefined Responses
+==================================================================================
 
-This module contains all system prompts for the HR Chatbot with:
-- Chain-of-thought reasoning templates
+This module contains:
+- All system prompts for the HR Chatbot
+- Predefined responses for common queries (greetings, identity, etc.)
 - Multi-language support (English, Bangla, Banglish)
+- Chain-of-thought reasoning templates
 - Anti-hallucination safeguards
-- Context-aware response generation
-- Easy prompt versioning and A/B testing
-
-Usage:
-    from prompt_config import PromptManager
-    pm = PromptManager()
-    prompt = pm.get_system_prompt(language="bn", context_type="policy")
 """
 
 from typing import Dict, Optional, Literal
-import json
-from datetime import datetime
+import random # CRITICAL: For choosing random responses
 
 # ============================================================================
 # PROMPT VERSION CONTROL
 # ============================================================================
-PROMPT_VERSION = "2.1.0" # Updated version
+PROMPT_VERSION = "2.2.1" 
 LAST_UPDATED = "2025-01-30"
+
+# ============================================================================
+# PREDEFINED RESPONSES FOR INSTANT REPLIES (No LLM needed)
+# NOTE: Values are LISTS of strings for variety!
+# ============================================================================
+PREDEFINED_RESPONSES = {
+    "greeting": {
+        "en": [
+            "Hello! I'm your HR assistant. I can help you with leave policies, benefits, working hours, and employee information. How can I help you today?",
+            "Hi there! As the Acme AI HR Chatbot, I'm here to assist with all your HR queries. What's on your mind?",
+            "Good day! I am the HR bot. Tell me about your HR question, and I'll find the answer."
+        ],
+        
+        "bn": [
+            "হ্যালো! আমি আপনার HR সহায়ক। আমি ছুটি, নীতি এবং কর্মচারী তথ্য নিয়ে সাহায্য করতে পারি। আজ কীভাবে সাহায্য করি?",
+            "স্বাগতম! আমি Acme AI-এর HR সহকারী। আপনার HR সংক্রান্ত কী প্রশ্ন আছে?",
+            "নমস্কার! HR-এর কোনো তথ্য জানতে চাইলে আমাকে জিজ্ঞাসা করতে পারেন।"
+        ],
+        
+        "banglish": [
+            "Hello! Ami apnar HR assistant. Chuti, policy ar employee info te help korte pari. Ki jante chan?",
+            "Hi! Ami HR bot. Kon policy ba employee info lagbe, bolun.",
+            "Shubho din! Ki help lagbe HR-related?"
+        ]
+    },
+    
+    "identity": {
+        "en": [
+            """I'm your HR Chatbot developed for Acme AI Ltd. I can help you with:
+
+• Leave policies and procedures
+• Salary and benefits information  
+• Office hours and holidays
+• Employee directory lookup
+• HR policy questions
+• Working procedures
+
+What would you like to know?""",
+            """I am the Acme AI HR Assistant. My purpose is to provide quick, accurate information from the company's HR knowledge base. Ask me about policies, procedures, or employee details."""
+        ],
+        
+        "bn": [
+            """আমি Acme AI Ltd.-এর জন্য তৈরি HR চ্যাটবট। আমি আপনাকে সাহায্য করতে পারি:
+
+• ছুটির নীতি এবং পদ্ধতি
+• বেতন এবং সুবিধার তথ্য
+• অফিসের সময় এবং ছুটির দিন
+• কর্মচারী ডিরেক্টরি
+• HR নীতির প্রশ্ন
+• কাজের পদ্ধতি
+
+আপনি কী জানতে চান?""",
+            """আমি Acme AI-এর HR সহকারী। প্রতিষ্ঠানের HR নীতি, পদ্ধতি এবং কর্মচারীদের তথ্য দ্রুত জানাতে আমি সাহায্য করি।"""
+        ],
+        
+        "banglish": [
+            """Ami Acme AI Ltd.-er jonno toiri HR Chatbot. Ami apnake help korte pari:
+
+• Chutir niti ebong poddhoti
+• Beton ebong subidhar tothyo
+• Office-er somoy ebong chutir din
+• Kormochari directory
+• HR nitir proshno
+• Kajer poddhoti
+
+Apni ki jante chan?""",
+            "Ami Acme AI HR Assistant. Amar kaj holo policy, procedure ba employee info dewa. Ki dorkar?"
+        ]
+    },
+    
+    "thanks": {
+        "en": [
+            "You're welcome! Feel free to ask if you need any other HR information.",
+            "My pleasure! Is there anything else I can assist you with regarding HR policies?",
+            "Glad I could help. Come back anytime!"
+        ],
+        "bn": [
+            "আপনাকে স্বাগতম! আরও কোনো HR তথ্য প্রয়োজন হলে জিজ্ঞাসা করুন।",
+            "আপনাকে সাহায্য করতে পেরে ভালো লাগলো। অন্য কোনো HR প্রশ্ন আছে?",
+            "স্বাগতম! অন্য কোনো প্রশ্ন থাকলে বলুন。"
+        ],
+        "banglish": [
+            "Apnake swagatom! Aro kono HR tothyo proyojon hole jiggasha korun.",
+            "Shukria! Ar kono HR help lagle janaben.",
+            "Welcome! Ar ki jante chan?"
+        ]
+    },
+    
+    "goodbye": {
+        "en": [
+            "Goodbye! Have a great day. Feel free to come back anytime you need HR assistance.",
+            "See you later! Remember to check back if you have more HR questions.",
+            "Take care! Wishing you a productive day."
+        ],
+        "bn": [
+            "বিদায়! আপনার দিন শুভ হোক। HR সাহায্য প্রয়োজন হলে যেকোনো সময় আসুন。",
+            "পরে দেখা হবে! অন্য কোনো প্রশ্ন থাকলে অবশ্যই ফিরে আসবেন。",
+            "ভালো থাকবেন! প্রয়োজন হলে আবার কথা হবে。"
+        ],
+        "banglish": [
+            "Biday! Apnar din shubho hok. HR sahajyo proyojon hole jeকোনো somoy asun.",
+            "Bye! Besh bhalo thakben. Kichu lagle abar ashen.",
+            "Later! Din ta bhalo katuk."
+        ]
+    },
+
+    # New intent for casual conversation
+    "small_talk": {
+        "en": [
+            "I'm doing great, thank you for asking! How can I assist you with your HR-related queries?",
+            "As an AI, I don't have feelings, but I'm fully operational and ready to help with HR policies. What do you need?",
+            "I'm functioning optimally, thanks! Are you looking for information on policies or employee details today?"
+        ],
+        "bn": [
+            "আমি ভালো আছি, জিজ্ঞাসা করার জন্য ধন্যবাদ! আমি আপনাকে আপনার HR সংক্রান্ত প্রশ্ন নিয়ে কীভাবে সাহায্য করতে পারি?",
+            "একটি AI হিসেবে আমার কোনো অনুভূতি নেই, কিন্তু আমি পুরোপুরি প্রস্তুত। আপনি আজ কী জানতে চান?",
+            "আমি ঠিক আছি, ধন্যবাদ! আপনার HR সংক্রান্ত কী সাহায্য চাই?"
+        ],
+        "banglish": [
+            "Ami bhalo achi, jiggesh korar jonno dhonnobad! Ami apnake HR-related ki help korte pari?",
+            "As an AI, amar kono feel nai, but ami fully operational and ready to help. Ki jante chan?",
+            "I'm perfectly fine, thanks for asking! Aj kon HR policy or info lagbe?"
+        ]
+    }
+}
+
+# ============================================================================
+# GREETING PATTERNS FOR INTENT DETECTION
+# ============================================================================
+GREETING_PATTERNS = [
+    "hello", "hi", "hey", "greetings", "good morning", "good afternoon",
+    "good evening", "good night", "salam", "assalamualaikum", "namaste",
+    "hola", "sup", "wassup", "হ্যালো", "হাই"
+]
+
+IDENTITY_PATTERNS = [
+    "who are you", "what can you do", "what are you", "introduce yourself",
+    "tell me about yourself", "your name", "what is your purpose",
+    "tumi ke", "apni ke", "tumi ki korte paro", "তুমি কে", "আপনি কে",
+    "তুমি কি করতে পারো"
+]
+
+THANKS_PATTERNS = [
+    "thank you", "thanks", "thank", "thx", "thnx", "appreciate it",
+    "dhonnobad", "shukria", "ধন্যবাদ", "শুকরিয়া"
+]
+
+GOODBYE_PATTERNS = [
+    "bye", "goodbye", "see you", "see ya", "later", "gotta go",
+    "alvida", "khoda hafez", "বিদায়", "আলবিদা"
+]
+
+SMALL_TALK_PATTERNS = [
+    "how are you", "how are you doing", "kemon acho", "kemon achen", "how r u",
+    "what's up", "ki obostha", "ki khobor", "what up", "ki koro",
+    "কেমন আছো", "কেমন আছেন", "কী অবস্থা", "কেমন আছেন আপনি"
+]
 
 # ============================================================================
 # LANGUAGE-SPECIFIC INSTRUCTIONS
@@ -39,7 +190,7 @@ LANGUAGE_INSTRUCTIONS = {
         "name": "Bangla",
         "instruction": "সম্পূর্ণ বাংলা ভাষায় উত্তর দিন (Reply fully in Bangla).",
         "tone": "পেশাদার, বন্ধুত্বপূর্ণ, কথোপকথনমূলক",
-        "example": "সংক্ষিপ্ত এবং সহায়ক উত্তর প্রদান করুন।"
+        "example": "সংক্ষিপ্ত এবং সহায়ক উত্তর প্রদান করুন。"
     },
     "banglish": {
         "name": "Banglish (Romanized Bangla)",
@@ -124,7 +275,7 @@ Tone: {lang_config['tone']}
 
 2. RESPONSE LENGTH
    - Keep answers SHORT: 1-3 sentences maximum
-   - For simple queries (greetings, identity): 1 sentence
+   - For simple queries (greeting, identity): 1 sentence
    - For policy queries: 2-3 sentences with key facts only
    - NEVER write long paragraphs or bullet lists unless explicitly asked
 
@@ -133,17 +284,11 @@ Tone: {lang_config['tone']}
    - Reply in the EXACT same language (English, Bangla, or Banglish)
    - Never mix languages in a single response
 
-4. IDENTITY QUERIES
-   When asked "Who are you?" or "What can you do?", use these exact responses:
-   
-   English:
-   "I'm your HR assistant — I can help with leave policies, benefits, working hours, and employee info. How can I help?"
-   
-   Bangla:
-   "আমি আপনার HR সহকারী — ছুটি, নীতি এবং কর্মচারী তথ্য নিয়ে সাহায্য করতে পারি। কিভাবে সাহায্য করি?"
-   
-   Banglish:
-   "Ami apnar HR assistant — chuti, policy ar employee info te help korte pari. Ki jante chan?"
+4. CONVERSATIONAL HANDLING
+   - For greetings: Respond warmly and briefly
+   - For thanks: Acknowledge politely
+   - For goodbyes: Wish them well
+   - For casual chat: Be friendly but guide toward HR topics
 
 5. EMPLOYEE LOOKUPS
    - ONLY provide employee info if it exists in employees.json
@@ -248,10 +393,11 @@ You must:
     "greeting": """
 GREETING MODE ACTIVATED
 
-Respond warmly and briefly:
-- English: "Hello! I'm your HR assistant. How can I help with leave, policies, or employee info today?"
-- Bangla: "হ্যালো! আমি আপনার HR সহায়ক। আজ ছুটি, নীতি বা কর্মচারী তথ্য নিয়ে কীভাবে সাহায্য করতে পারি?"
-- Banglish: "Hello! Ami apnar HR assistant. Chuti, policy ba employee info te ki help lagbe?"
+Respond warmly and briefly - this should have been handled by predefined responses,
+but if you're seeing this, reply naturally:
+- Be friendly and welcoming
+- Briefly mention your capabilities
+- Ask how you can help
 """,
 
     "complaint_urgent": """
@@ -277,7 +423,6 @@ class PromptManager:
     """
     
     def __init__(self, version: str = PROMPT_VERSION):
-        # Initializing prompts here makes subsequent lookups fast and thread-safe
         self.version = version
         self.prompts = {}
         self._initialize_prompts()
@@ -300,14 +445,13 @@ class PromptManager:
         # Get base prompt (pre-generated and thread-safe)
         base_prompt = self.prompts.get(language, self.prompts["en"])
         
-        # Add specialized instructions if requested (e.g. from an explicit intent detector)
+        # Add specialized instructions if requested
         specialized_instruction = ""
         if context_type in SPECIALIZED_PROMPTS:
             specialized_instruction = SPECIALIZED_PROMPTS[context_type]
         
         # Add emotion-specific instructions
         if user_emotion in ["urgent", "frustrated"]:
-            # Prioritize complaint instructions if emotion is detected
             specialized_instruction = SPECIALIZED_PROMPTS.get("complaint_urgent", "")
 
         if specialized_instruction:
@@ -315,27 +459,29 @@ class PromptManager:
             
         return base_prompt
     
-    def get_user_prompt_template(self, has_context: bool = True) -> str:
+    def get_predefined_response(self, intent: str, language: str = "en") -> Optional[str]:
         """
-        Get the user message template for Ollama.
+        Get predefined response for common intents (no LLM needed).
+        
+        Args:
+            intent: Intent type ('greeting', 'identity', 'thanks', 'goodbye', 'small_talk')
+            language: Language code ('en', 'bn', 'banglish')
+        
+        Returns:
+            Randomly selected predefined response string or None if not available
         """
-        if has_context:
-            return """Context from {source}:
-{context}
-
-Previous conversation:
-{history}
-
-User question: {query}
-
-Please answer concisely using the context above."""
-        else:
-            return """Previous conversation:
-{history}
-
-User question: {query}
-
-Please answer concisely."""
+        if intent in PREDEFINED_RESPONSES:
+            # Check for language-specific responses, fallback to English list
+            responses = PREDEFINED_RESPONSES[intent].get(language, PREDEFINED_RESPONSES[intent].get("en", []))
+            
+            # If the response is a list, choose one randomly
+            if isinstance(responses, list) and responses:
+                return random.choice(responses)
+            # Fallback for single string response (which shouldn't happen with the new structure)
+            elif isinstance(responses, str):
+                return responses
+                
+        return None
     
     def get_prompt_metadata(self) -> Dict:
         """Get prompt version info for logging/monitoring"""
@@ -343,36 +489,41 @@ Please answer concisely."""
             "version": self.version,
             "last_updated": LAST_UPDATED,
             "supported_languages": list(LANGUAGE_INSTRUCTIONS.keys()),
-            "total_prompts": len(self.prompts)
+            "total_prompts": len(self.prompts),
+            "predefined_responses": list(PREDEFINED_RESPONSES.keys())
         }
 
 # ============================================================================
-# QUICK ACCESS FUNCTIONS (for backward compatibility and backend.py)
+# QUICK ACCESS FUNCTIONS (SINGLETON PATTERN)
 # ============================================================================
-def get_system_prompt(language: str = "en", context_type: Optional[str] = None) -> str:
-    """
-    Quick access to system prompt. Creates a temporary PromptManager instance 
-    to ensure thread safety in server environments (like FastAPI).
-    """
-    pm = PromptManager()
-    return pm.get_system_prompt(language, context_type)
+# Instantiate PromptManager only ONCE when the module loads
+_PROMPT_MANAGER_INSTANCE = PromptManager()
 
-def get_user_prompt(context: str, history: str, query: str, source: str = "HR policies") -> str:
-    """Quick access to formatted user prompt"""
-    pm = PromptManager()
-    template = pm.get_user_prompt_template(has_context=bool(context))
-    return template.format(
-        context=context,
-        history=history,
-        query=query,
-        source=source
-    )
+def get_system_prompt(language: str = "en", context_type: Optional[str] = None) -> str:
+    """Quick access to system prompt using the single instance."""
+    return _PROMPT_MANAGER_INSTANCE.get_system_prompt(language, context_type)
+
+def get_predefined_response(intent: str, language: str = "en") -> Optional[str]:
+    """
+    Quick access to predefined responses using the single instance.
+    """
+    return _PROMPT_MANAGER_INSTANCE.get_predefined_response(intent, language)
+
+# ============================================================================
+# INTENT DETECTION HELPERS (for backend.py)
+# ============================================================================
+def check_intent_patterns(text: str, patterns: list) -> bool:
+    """
+    Check if text matches any pattern in the list.
+    """
+    text_lower = text.lower().strip()
+    return any(pattern in text_lower for pattern in patterns)
 
 # ============================================================================
 # TESTING & VALIDATION
 # ============================================================================
 def test_prompts():
-    """Test all prompt variations"""
+    """Test all prompt variations and predefined responses"""
     pm = PromptManager()
     
     print("=" * 70)
@@ -383,21 +534,35 @@ def test_prompts():
     print(f"\nSupported Languages: {list(LANGUAGE_INSTRUCTIONS.keys())}")
     
     print("\n" + "=" * 70)
-    print("SAMPLE PROMPTS")
+    print("PREDEFINED RESPONSES TEST (Showing one random sample)")
     print("=" * 70)
     
-    for lang in ["en", "bn", "banglish"]:
-        print(f"\n{'='*70}")
-        print(f"LANGUAGE: {lang.upper()} (Base)")
-        print('='*70)
-        prompt = pm.get_system_prompt(lang)
-        print(prompt[:500] + "...\n")
-        
-        print(f"\n{'='*70}")
-        print(f"LANGUAGE: {lang.upper()} (Salary/Benefits)")
-        print('='*70)
-        prompt = pm.get_system_prompt(lang, context_type="salary_benefits")
-        print(prompt[-300:] + "...\n")
+    for intent in PREDEFINED_RESPONSES.keys():
+        print(f"\n--- Intent: {intent.upper()} ---")
+        for lang in ["en", "bn", "banglish"]:
+            response = pm.get_predefined_response(intent, lang)
+            print(f"\n[{lang.upper()}]:")
+            print(response)
+    
+    print("\n" + "=" * 70)
+    print("PATTERN DETECTION TEST")
+    print("=" * 70)
+    
+    test_inputs = [
+        "hello", "hi there", "good morning",
+        "who are you", "what can you do",
+        "thank you", "thanks a lot",
+        "goodbye", "see you later",
+        "how are you", "kemon achen"
+    ]
+    
+    for test_input in test_inputs:
+        print(f"\nInput: '{test_input}'")
+        print(f"  Greeting: {check_intent_patterns(test_input, GREETING_PATTERNS)}")
+        print(f"  Small Talk: {check_intent_patterns(test_input, SMALL_TALK_PATTERNS)}")
+        print(f"  Identity: {check_intent_patterns(test_input, IDENTITY_PATTERNS)}")
+        print(f"  Thanks: {check_intent_patterns(test_input, THANKS_PATTERNS)}")
+        print(f"  Goodbye: {check_intent_patterns(test_input, GOODBYE_PATTERNS)}")
 
 if __name__ == "__main__":
     test_prompts()
