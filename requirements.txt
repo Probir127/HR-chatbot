@@ -1,20 +1,32 @@
-# Core Framework
 fastapi
-uvicorn
+uvicorn[standard]
 python-dotenv
+# HTTP Requests (for Ollama)
+requests
 
-# HR Chatbot AI
+# AI & Embeddings
 sentence-transformers
 faiss-cpu
-numpy
-requests
+
+# Translation
+deep-translator
 
 # PDF Processing
 PyMuPDF
+pdfminer.six
 
-# API / Data Models
+# Data Handling
+numpy
+pandas
+
+# Utility
 pydantic
 
-# Optional Utilities
-jinja2
-pandas
+# LangChain (optional)
+langchain
+langchain-community
+langchain-text-splitters
+
+# Scheduling Tasks                           
+APScheduler 
+numpy
