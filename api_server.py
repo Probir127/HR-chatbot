@@ -1,21 +1,32 @@
 # api_server.py - HR Chatbot API Server
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import backend
 import os, json, hashlib, secrets
 from datetime import datetime, timedelta
+import threading 
+from apscheduler.schedulers.background import BackgroundScheduler # Requires: pip install apscheduler
+import asyncio # CRITICAL: For running synchronous backend code correctly
 
 app = FastAPI(title="HR Chatbot API")
 
+# Configure CORS
+# WARNING: Allow_origins=["*"] is insecure for production. Change to your specific domain(s).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- THREAD SAFETY LOCKS ---
+USER_LOCK = threading.Lock()
+SESSION_LOCK = threading.Lock()
+CONTEXT_LOCK = threading.Lock()
+# --------------------------
 
 # --- User Models ---
 class UserRegister(BaseModel):
@@ -62,12 +73,22 @@ def hash_password(password: str) -> str:
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return hash_password(plain_password) == hashed_password
 
-# --- User Management ---
-def load_users(): return load_json(USERS_FILE, [])
-def save_users(users): save_json(USERS_FILE, users)
+# --- User Management (Protected with Locks) ---
+def load_users():
+    with USER_LOCK: 
+        return load_json(USERS_FILE, [])
 
-def load_sessions(): return load_json(SESSIONS_FILE, {})
-def save_sessions(sessions): save_json(SESSIONS_FILE, sessions)
+def save_users(users):
+    with USER_LOCK: 
+        save_json(USERS_FILE, users)
+
+def load_sessions(): 
+    with SESSION_LOCK: 
+        return load_json(SESSIONS_FILE, {})
+
+def save_sessions(sessions):
+    with SESSION_LOCK: 
+        save_json(SESSIONS_FILE, sessions)
 
 def create_session(user_id: str) -> str:
     sessions = load_sessions()
@@ -86,12 +107,14 @@ def verify_session(token: str) -> Optional[str]:
         return None
     session = sessions[token]
     if datetime.now() > datetime.fromisoformat(session["expires_at"]):
-        del sessions[token]
-        save_sessions(sessions)
+        with SESSION_LOCK: 
+            if token in sessions:
+                del sessions[token]
+                save_sessions(sessions)
         return None
     return session["user_id"]
 
-# --- In-Memory Short-Term Context Cache ---
+# --- In-Memory Short-Term Context Cache (Protected with Lock) ---
 SESSION_CONTEXTS = {}
 CONTEXT_EXPIRY_MINUTES = 10
 MAX_CONTEXT_MESSAGES = 3
@@ -99,22 +122,41 @@ MAX_CONTEXT_MESSAGES = 3
 def update_session_context(session_id: str, role: str, message: str):
     """Stores short-term conversational context per session."""
     now = datetime.now()
-    if session_id not in SESSION_CONTEXTS:
-        SESSION_CONTEXTS[session_id] = {"messages": [], "last_active": now}
-    ctx = SESSION_CONTEXTS[session_id]
-    ctx["messages"].append({"role": role, "content": message})
-    ctx["messages"] = ctx["messages"][-MAX_CONTEXT_MESSAGES:]  # keep last few
-    ctx["last_active"] = now
+    with CONTEXT_LOCK: 
+        if session_id not in SESSION_CONTEXTS:
+            SESSION_CONTEXTS[session_id] = {"messages": [], "last_active": now}
+        ctx = SESSION_CONTEXTS[session_id]
+        ctx["messages"].append({"role": role, "content": message})
+        ctx["messages"] = ctx["messages"][-MAX_CONTEXT_MESSAGES:]  
+        ctx["last_active"] = now
 
 def get_recent_context(session_id: str):
     """Return recent messages if session still active."""
-    ctx = SESSION_CONTEXTS.get(session_id)
-    if not ctx:
-        return []
-    if datetime.now() - ctx["last_active"] > timedelta(minutes=CONTEXT_EXPIRY_MINUTES):
-        del SESSION_CONTEXTS[session_id]
-        return []
-    return ctx["messages"]
+    with CONTEXT_LOCK: 
+        ctx = SESSION_CONTEXTS.get(session_id)
+        if not ctx:
+            return []
+        if datetime.now() - ctx["last_active"] > timedelta(minutes=CONTEXT_EXPIRY_MINUTES):
+            del SESSION_CONTEXTS[session_id]
+            return []
+        return ctx["messages"]
+
+def cleanup_expired_contexts(): 
+    """Remove expired session contexts to prevent memory leak"""
+    now = datetime.now()
+    with CONTEXT_LOCK:
+        expired = [
+            sid for sid, ctx in SESSION_CONTEXTS.items()
+            if now - ctx["last_active"] > timedelta(minutes=CONTEXT_EXPIRY_MINUTES)
+        ]
+        for sid in expired:
+            if sid in SESSION_CONTEXTS: 
+                del SESSION_CONTEXTS[sid]
+
+# Start background cleanup job (Runs on startup)
+scheduler = BackgroundScheduler()
+scheduler.add_job(cleanup_expired_contexts, 'interval', minutes=CONTEXT_EXPIRY_MINUTES)
+scheduler.start()
 
 # --- Authentication Endpoints ---
 @app.post("/register")
@@ -156,9 +198,10 @@ async def login(login_data: UserLogin):
 @app.post("/logout")
 async def logout(token: str):
     sessions = load_sessions()
-    if token in sessions:
-        del sessions[token]
-        save_sessions(sessions)
+    with SESSION_LOCK: 
+        if token in sessions:
+            del sessions[token]
+            save_sessions(sessions)
     return {"status": "success", "message": "Logout successful"}
 
 @app.get("/verify-session")
@@ -183,15 +226,19 @@ def root():
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     try:
-        # Determine session context (anonymous or user-based)
         session_id = request.session_token or "anon"
 
         # Load previous short-term context
         recent_context = get_recent_context(session_id)
         combined_history = recent_context + [{"role": "user", "content": request.message}]
 
-        # Generate reply
-        reply = backend.ask_hr_bot(user_input=request.message, chat_history=combined_history, session_id=session_id)
+        # Generate reply - Use asyncio.to_thread for synchronous backend calls
+        reply = await asyncio.to_thread(
+            backend.ask_hr_bot, 
+            user_input=request.message, 
+            chat_history=combined_history, 
+            session_id=session_id
+        )
 
         # Store this exchange for next query
         update_session_context(session_id, "user", request.message)
@@ -200,6 +247,7 @@ async def chat_endpoint(request: ChatRequest):
         return {"response": reply, "context": combined_history[-MAX_CONTEXT_MESSAGES:]}
     except Exception as e:
         print("❌ Chat Error:", e)
+        # Re-raise as HTTPException so the client receives a proper error status
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
