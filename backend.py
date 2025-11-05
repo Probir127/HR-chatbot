@@ -59,6 +59,9 @@ if os.path.exists(EMPLOYEE_JSON_PATH):
         with open(EMPLOYEE_JSON_PATH, "r", encoding="utf-8") as f:
             EMPLOYEES = json.load(f)
         print(f"✅ Loaded {len(EMPLOYEES)} employees from {EMPLOYEE_JSON_PATH}")
+        # Print first few for verification
+        for i, emp in enumerate(EMPLOYEES[:3]):
+            print(f"  👤 {emp.get('name', 'N/A')} - {emp.get('position', 'N/A')}")
     except Exception as e:
         EMPLOYEES = []
         print(f"⚠️ Failed to load employees.json: {e}")
@@ -158,22 +161,13 @@ def classify_intent(text: str) -> str:
         return "goodbye"
 
     # 2. Employee Lookup - VERY SPECIFIC patterns only
-    # ✅ FIX: Added trailing spaces to prevent "what is" matching "who is"
     employee_trigger_phrases = [
-        "who is ",      # Note the trailing space!
-        "who's ",
-        "who are ",
-        "details of ",
-        "contact for ",
-        "email of ",
-        "find employee",
-        "employee named",
-        "staff member",
-        "about "  # Only when followed by a name
+        "who is", "who's", "who are", "details of", "contact for", 
+        "email of", "find employee", "employee named", "staff member", "about"
     ]
     
     # Check if query has employee-specific trigger
-    has_employee_trigger = any(phrase in text_l + " " for phrase in employee_trigger_phrases)
+    has_employee_trigger = any(phrase in text_l for phrase in employee_trigger_phrases)
     
     if has_employee_trigger:
         # Extra validation: must have a name-like pattern
@@ -219,44 +213,86 @@ def classify_intent(text: str) -> str:
     return "policy_question"
 
 # ============================================================================
-# EMPLOYEE LOOKUP UTILITIES
+# EMPLOYEE LOOKUP UTILITIES - IMPROVED VERSION
 # ============================================================================
 def extract_person_name(text: str) -> Optional[str]:
-    """Extract person name from query"""
-    # Look for explicit phrase patterns with trailing context
+    """Extract person name from query - IMPROVED VERSION"""
+    text_l = text.lower().strip()
+    
+    # Remove common phrases to isolate the name
+    patterns_to_remove = [
+        r"who is", r"who's", r"who are", r"about", r"details of", 
+        r"email of", r"contact for", r"find", r"search", r"employee",
+        r"staff", r"member", r"named", r"tell me about", r"information about"
+    ]
+    
+    cleaned_text = text_l
+    for pattern in patterns_to_remove:
+        cleaned_text = re.sub(pattern, "", cleaned_text)
+    
+    cleaned_text = cleaned_text.strip()
+    
+    # Look for capitalized names (English)
+    caps = re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b", text)
+    if caps:
+        # Return the longest capitalized sequence (most likely the name)
+        return max(caps, key=len).strip()
+    
+    # For single word queries that might be names
+    if len(cleaned_text.split()) == 1 and len(cleaned_text) >= 3:
+        # Check if this could be a name by capitalizing
+        potential_name = cleaned_text.title()
+        # Verify it exists in employee database
+        if get_employee_by_name(potential_name):
+            return potential_name
+    
+    # Try to extract from common patterns
     patterns = [
         r"(?:who is|who's|who are)\s+([A-Za-z .'-]{2,})",
         r"(?:about|details of|email of|contact for)\s+([A-Za-z .'-]{2,})",
-        r"(?:find|search)\s+(?:employee|staff)?\s*(?:named)?\s+([A-Za-z .'-]{2,})"
+        r"(?:find|search)\s+(?:employee|staff)?\s*(?:named)?\s+([A-Za-z .'-]{2,})",
+        r"tell me about\s+([A-Za-z .'-]{2,})"
     ]
     
     for pattern in patterns:
-        m = re.search(pattern, text, re.I)
+        m = re.search(pattern, text_l, re.I)
         if m:
-            return m.group(1).strip()
-    
-    # Fallback: find capitalized sequences (English names)
-    caps = re.findall(r"\b([A-Z][a-z]{1,}\s(?:[A-Z][a-z]{1,}\s?)*)\b", text)
-    if caps:
-        return max(caps, key=len).strip()
-    
-    # Last resort: single capitalized word (if query is very short)
-    if len(text.split()) <= 3:
-        single_cap = re.findall(r"\b([A-Z][a-z]{2,})\b", text)
-        if single_cap:
-            return single_cap[0]
+            name_candidate = m.group(1).strip()
+            if len(name_candidate) >= 3:  # Minimum name length
+                return name_candidate.title()
     
     return None
 
 def get_employee_by_name(name: str) -> Optional[Dict]:
-    """Search employee in database by name"""
+    """Search employee in database by name - IMPROVED VERSION"""
     if not name:
         return None
     
     name_l = name.lower().strip()
+    
+    # Try exact match first
     for emp in EMPLOYEES:
-        # Fuzzy match on employee name
-        if name_l in emp.get("name", "").lower():
+        if name_l == emp.get("name", "").lower():
+            return emp
+    
+    # Try partial match
+    for emp in EMPLOYEES:
+        emp_name = emp.get("name", "").lower()
+        if name_l in emp_name or emp_name in name_l:
+            return emp
+    
+    # Try first name only
+    first_name = name_l.split()[0] if " " in name_l else name_l
+    for emp in EMPLOYEES:
+        emp_first_name = emp.get("name", "").lower().split()[0]
+        if first_name == emp_first_name:
+            return emp
+    
+    # Try fuzzy matching by individual words
+    name_words = set(name_l.split())
+    for emp in EMPLOYEES:
+        emp_words = set(emp.get("name", "").lower().split())
+        if name_words.intersection(emp_words):
             return emp
     
     return None
@@ -322,22 +358,31 @@ def search_knowledge_base(query: str, top_k: int = 3) -> tuple:
     return context, top_score
 
 # ============================================================================
-# OLLAMA LLM CALLS
+# OLLAMA LLM CALLS - IMPROVED ERROR HANDLING
 # ============================================================================
 def call_ollama(payload_json: dict, timeout: int = 60) -> dict:
-    """Make synchronous call to Ollama API"""
+    """Make synchronous call to Ollama API with better error handling"""
     try:
         url = f"{OLLAMA_BASE_URL}/api/chat"
+        print(f"🔧 Calling Ollama at: {url}")
+        
         r = requests.post(url, json=payload_json, timeout=timeout) 
         
         # Fallback to /api/generate for older Ollama versions
         if r.status_code == 404:
+            print("🔄 Trying /api/generate endpoint...")
             url = f"{OLLAMA_BASE_URL}/api/generate"
             r = requests.post(url, json=payload_json, timeout=timeout)
         
         r.raise_for_status()
         return r.json()
     
+    except requests.exceptions.ConnectionError:
+        print("❌ Cannot connect to Ollama. Is it running?")
+        return {"error": "Ollama service unavailable - please ensure Ollama is running on localhost:11434"}
+    except requests.exceptions.Timeout:
+        print("❌ Ollama request timed out")
+        return {"error": "Request timeout - Ollama is taking too long to respond"}
     except Exception as e:
         print(f"❌ Ollama call failed: {e}")
         return {"error": str(e)}
@@ -349,7 +394,7 @@ def call_ollama_with_history(
     max_tokens: int = 300
 ) -> str:
     """
-    Call Ollama with full conversation history.
+    Call Ollama with full conversation history - IMPROVED ERROR HANDLING
     """
     # Construct full message payload
     messages_payload = [{"role": "system", "content": system_prompt}] + messages_history 
@@ -364,16 +409,29 @@ def call_ollama_with_history(
         }
     }
     
+    print(f"🤖 Sending request to Ollama with model: {OLLAMA_MODEL}")
     resp = call_ollama(payload)
     
-    # Extract response
+    # Extract response with better error handling
+    if isinstance(resp, dict) and "error" in resp:
+        error_msg = resp["error"]
+        print(f"❌ Ollama error: {error_msg}")
+        if "unavailable" in error_msg.lower() or "connection" in error_msg.lower():
+            return "⚠️ The AI service is currently unavailable. Please try again later or contact HR directly at people@acmeai.tech."
+        else:
+            return f"⚠️ Technical issue: {error_msg}. Please contact HR at people@acmeai.tech."
+    
     if isinstance(resp, dict) and "message" in resp and isinstance(resp["message"], dict):
-        return resp["message"].get("content", "").strip()
+        response_content = resp["message"].get("content", "").strip()
+        print(f"✅ Ollama response received: {len(response_content)} characters")
+        return response_content
     elif isinstance(resp, dict) and "response" in resp:
-        return str(resp.get("response", "")).strip()
+        response_content = str(resp.get("response", "")).strip()
+        print(f"✅ Ollama response received: {len(response_content)} characters")
+        return response_content
     else:
-        # Fallback for LLM failure/garbage
-        return "⚠️ I couldn't get a coherent response from the AI model. Please try again or contact HR at people@acmeai.tech."
+        print("❌ Unexpected response format from Ollama")
+        return "⚠️ I couldn't process your request. Please try again or contact HR at people@acmeai.tech."
 
 # ============================================================================
 # MAIN QUERY HANDLER - UPDATED WITH SESSION AWARENESS
@@ -393,6 +451,7 @@ def handle_hr_query(
     # Log session info for debugging
     print(f"🆔 Session ID: {session_id}")
     print(f"💬 History length: {len(chat_history)}")
+    print(f"📝 User input: '{user_input}'")
     
     # Validate input
     if not user_input:
@@ -416,6 +475,7 @@ def handle_hr_query(
     # STEP 4: Handle Employee Lookup (Direct Path)
     if intent == "employee_lookup":
         name = extract_person_name(user_input)
+        print(f"🔍 Extracted name: '{name}'")
         if name:
             emp = get_employee_by_name(name)
             if emp:
@@ -423,8 +483,21 @@ def handle_hr_query(
                 return format_employee_info(emp)
             else:
                 print(f"❌ Employee not found: {name}")
-                return "❌ I couldn't find that employee in our records."
-        # If intent is lookup but no name was extracted, proceed to RAG (Step 5)
+                # Try to provide helpful suggestions
+                similar_names = []
+                name_l = name.lower()
+                for employee in EMPLOYEES:
+                    if name_l in employee["name"].lower():
+                        similar_names.append(employee["name"])
+                
+                if similar_names:
+                    suggestions = ", ".join(similar_names[:3])
+                    return f"❌ I couldn't find '{name}'. Did you mean: {suggestions}?"
+                else:
+                    return "❌ I couldn't find that employee in our records. Please check the spelling or contact HR at people@acmeai.tech."
+        else:
+            print("❌ No name could be extracted from query")
+            return "❌ I couldn't identify which employee you're looking for. Please try using their full name, like 'who is Omar Faruk'."
     
     # STEP 5: Search Knowledge Base
     context, score = search_knowledge_base(user_input)
@@ -497,9 +570,9 @@ if __name__ == "__main__":
     print("  - hello")
     print("  - who are you")
     print("  - what is the leave policy")
-    print("  - what is the company goal for the next two years")
-    print("  - how are you")
     print("  - who is Omar Faruk")
+    print("  - who is punom")
+    print("  - how are you")
     print("  - exit (to quit)")
     print("="*70 + "\n")
     
