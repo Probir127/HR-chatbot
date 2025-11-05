@@ -16,8 +16,8 @@ import random # CRITICAL: For choosing random responses
 # ============================================================================
 # PROMPT VERSION CONTROL
 # ============================================================================
-PROMPT_VERSION = "2.2.1" 
-LAST_UPDATED = "2025-01-30"
+PROMPT_VERSION = "2.2.2"  # Version incremented
+LAST_UPDATED = "2025-01-31"
 
 # ============================================================================
 # PREDEFINED RESPONSES FOR INSTANT REPLIES (No LLM needed)
@@ -270,7 +270,9 @@ Tone: {lang_config['tone']}
 1. GROUNDING & ACCURACY
    - Answer ONLY from the provided context and employees.json
    - NEVER invent, guess, or hallucinate facts
-   - If information is missing → say: "⚠️ I couldn't find that in HR policies. Please contact HR at people@acmeai.tech for details."
+   - CRITICAL FIX: If the query could NOT be answered by RAG (no context returned), use the fallback. 
+   - If context *was* provided, but it states a *negative* answer (e.g., "does not offer"), paraphrase the answer directly.
+   - If no context is retrieved and the answer is not in employees.json → say: "⚠️ I couldn't find that in HR policies. Please contact HR at people@acmeai.tech for details."
    - If uncertain about dates/numbers → use "approximately" or "typically"
 
 2. RESPONSE LENGTH
