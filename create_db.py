@@ -34,6 +34,7 @@ def smart_chunk_text(text):
     print("🧩 Chunking text...")
     
     chunks = []
+    # Split the entire text into sections based on the starting marker for a question
     qa_sections = re.split(r'###Question###', text)
     
     for section in qa_sections:
@@ -41,7 +42,14 @@ def smart_chunk_text(text):
             continue
         
         if '###Answer###' in section:
+            # Reconstruct the full Q&A pair string for this section
             qa_pair = "###Question###" + section
+            
+            # Function to clean markers from the final chunk
+            def clean_chunk_text(chunk):
+                # BEST PRACTICE FIX: Remove non-semantic markers and clean up excess spaces
+                cleaned = chunk.replace("###Question###", "").replace("###Answer###", "")
+                return re.sub(r'\s+', ' ', cleaned).strip()
             
             # Split long Q&A pairs
             if len(qa_pair) > CHUNK_SIZE:
@@ -49,15 +57,19 @@ def smart_chunk_text(text):
                 sentences = re.split(r'(?<=[.!?])\s+', qa_pair)
                 current = ""
                 for sent in sentences:
+                    # Check if adding the next sentence exceeds the chunk size
                     if len(current) + len(sent) > CHUNK_SIZE and current:
-                        chunks.append(current.strip())
+                        # Append the CLEANED current chunk
+                        chunks.append(clean_chunk_text(current.strip()))
                         current = sent
                     else:
                         current += " " + sent
                 if current.strip():
-                    chunks.append(current.strip())
+                    # Append the CLEANED remaining chunk
+                    chunks.append(clean_chunk_text(current.strip()))
             else:
-                chunks.append(qa_pair.strip())
+                # Append the CLEANED full Q&A pair
+                chunks.append(clean_chunk_text(qa_pair.strip()))
     
     print(f"✅ Created {len(chunks)} chunks")
     return chunks
