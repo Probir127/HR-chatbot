@@ -1,4 +1,3 @@
-
 # backend.py -- Clean backend using prompt_config module with Session Management
 import os
 import re
@@ -38,10 +37,10 @@ EMPLOYEE_JSON_PATH = os.getenv("EMPLOYEE_JSON_PATH", "data/employees.json")
 INDEX_PATH = os.getenv("INDEX_PATH", "vectorstores/db_faiss/index.faiss")
 TEXTS_PATH = os.getenv("TEXTS_PATH", "vectorstores/db_faiss/texts.npy")
 
-# === CRITICAL FIX CONSTANT: RAG Relevance Threshold ===
-# If the top search score is below this, we treat it as no context found.
-RAG_THRESHOLD = 0.5  # CRITICAL FIX (PRESERVED): Lowered from 0.6 to 0.5
-# ======================================================
+# === CRITICAL FIX: More Permissive RAG Threshold ===
+MIN_RAG_SCORE = 0.3  # Very permissive - only reject obvious garbage
+RELIABLE_SCORE = 0.35  # Minimum score for confident answers
+# ===================================================
 
 # Global variables for FAISS index and model (Lazy Loading setup)
 _FAISS_INDEX = None
@@ -132,36 +131,17 @@ def detect_language(text: str) -> str:
         return "en"
 
 # ============================================================================
-# INTENT CLASSIFICATION - CRITICAL FIX APPLIED HERE
+# INTENT CLASSIFICATION - FULLY FIXED VERSION
 # ============================================================================
 def classify_intent(text: str) -> str:
     """
     Classify user intent using pattern matching from prompt_config.
-    CRITICAL FIX: Reordered logic and added specific keywords to prevent misclassification.
+    CRITICAL FIX: Reordered logic to prevent "what is" misclassification.
     """
     text_l = text.lower().strip()
     
-    # 1. High-Priority Lookups (Bypass all other logic)
-    # Employee Lookup - High Priority (requires explicit "who/contact/details of")
-    if any(phrase in text_l for phrase in ["who is", "who's", "details of", "contact for", "email of", "about"]):
-        return "employee_lookup"
-
-    # 2. Specific Policy/Category Keywords (Bypass greetings/small-talk)
-    
-    # Salary & Benefits
-    if any(word in text_l for word in ["salary", "paycheck", "bonus", "increment", "pf", "allowance", "benefits", "loss hour", "deduction"]):
-        return "salary_benefits"
-        
-    # Procedure / How-To
-    if any(word in text_l for word in ["how to", "procedure", "process for", "resign", "apply for leave", "onboarding", "how can i", "how do i"]):
-        return "procedure_howto"
-        
-    # Office Logistics / Rules / General Policy Terms 
-    # CRITICAL FIX: Ensure keywords that relate to office *facts* are caught here.
-    if any(word in text_l for word in ["office time", "address", "washroom", "kitchen", "ac", "rules for", "dress code", "emergency", "facilities", "support", "conference", "office space", "floor"]):
-        return "office_logistics"
-    
-    # 3. Conversational/Low-Priority Intents (Only if no specific query detected above)
+    # 1. Conversational Intents FIRST (Check BEFORE policy keywords)
+    # This prevents "how are you" from triggering procedure_howto
     if check_intent_patterns(text, GREETING_PATTERNS):
         return "greeting"
     
@@ -177,12 +157,59 @@ def classify_intent(text: str) -> str:
     if check_intent_patterns(text, GOODBYE_PATTERNS):
         return "goodbye"
 
-    # 4. Final Fallback
-    # Employee Lookup (Heuristic: Single Name/Short Query) - Lower Priority
-    # CRITICAL FIX: If the user provides a *single* word that might be an employee name (like 'punom'), 
-    # and it is NOT preceded by 'who is', we treat it as a *policy question* to force RAG.
-    # The image shows "punom" failing because it likely matched a single name, but was too short 
-    # to be reliably considered an employee lookup in the absence of prefixes.
+    # 2. Employee Lookup - VERY SPECIFIC patterns only
+    # ✅ FIX: Added trailing spaces to prevent "what is" matching "who is"
+    employee_trigger_phrases = [
+        "who is ",      # Note the trailing space!
+        "who's ",
+        "who are ",
+        "details of ",
+        "contact for ",
+        "email of ",
+        "find employee",
+        "employee named",
+        "staff member",
+        "about "  # Only when followed by a name
+    ]
+    
+    # Check if query has employee-specific trigger
+    has_employee_trigger = any(phrase in text_l + " " for phrase in employee_trigger_phrases)
+    
+    if has_employee_trigger:
+        # Extra validation: must have a name-like pattern
+        name_guess = extract_person_name(text)
+        if name_guess:
+            return "employee_lookup"
+    
+    # 3. Specific Policy/Category Keywords
+    
+    # Salary & Benefits
+    if any(word in text_l for word in ["salary", "paycheck", "bonus", "increment", "pf", "provident fund", "allowance", "benefits", "loss hour", "deduction"]):
+        return "salary_benefits"
+        
+    # Procedure / How-To (but not "how are you")
+    if any(word in text_l for word in ["how to", "procedure", "process for", "resign", "apply for leave", "onboarding", "how can i", "how do i", "steps to"]):
+        return "procedure_howto"
+        
+    # Office Logistics / Rules / General Policy Terms 
+    if any(word in text_l for word in ["office time", "office hour", "address", "washroom", "kitchen", "ac", "rules for", "dress code", "emergency", "facilities", "support", "conference", "office space", "floor", "location"]):
+        return "office_logistics"
+    
+    # 4. General Policy Question Indicators
+    # ✅ FIX: These are now checked AFTER conversational intents
+    policy_question_indicators = [
+        "what is", "what are", "what's", 
+        "when is", "when are", 
+        "where is", "where are",
+        "why", "why is", "why are",
+        "tell me about", "explain", "describe",
+        "company goal", "company policy", "company rule"
+    ]
+    
+    if any(indicator in text_l for indicator in policy_question_indicators):
+        return "policy_question"
+    
+    # 5. Final Fallback - Single name lookup (LOWEST priority)
     name_guess = extract_person_name(text)
     if name_guess and len(text_l.split()) <= 3 and len(name_guess) >= 3:
         if get_employee_by_name(name_guess):
@@ -196,26 +223,28 @@ def classify_intent(text: str) -> str:
 # ============================================================================
 def extract_person_name(text: str) -> Optional[str]:
     """Extract person name from query"""
-    # Look for explicit phrase patterns
-    m = re.search(r"(?:who is|who's|who are|about|details of|email of|contact for)\s+([A-Za-z .'-]{2,})", text, re.I)
-    if m:
-        return m.group(1).strip()
+    # Look for explicit phrase patterns with trailing context
+    patterns = [
+        r"(?:who is|who's|who are)\s+([A-Za-z .'-]{2,})",
+        r"(?:about|details of|email of|contact for)\s+([A-Za-z .'-]{2,})",
+        r"(?:find|search)\s+(?:employee|staff)?\s*(?:named)?\s+([A-Za-z .'-]{2,})"
+    ]
+    
+    for pattern in patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            return m.group(1).strip()
     
     # Fallback: find capitalized sequences (English names)
     caps = re.findall(r"\b([A-Z][a-z]{1,}\s(?:[A-Z][a-z]{1,}\s?)*)\b", text)
     if caps:
-        # Prioritize the longest/most likely name extracted from capitalization
         return max(caps, key=len).strip()
     
-    # CRITICAL FIX: Add a check for a short, single-word query, which often refers to a name
-    # but could be a misspelling of a policy keyword (like the 'punom' failure).
-    text_l = text.lower().strip()
-    if len(text_l.split()) == 1 and len(text_l) >= 3:
-        # If a single word matches an employee name, treat it as the name for now.
-        # This will be filtered later in classify_intent's step 4 to promote RAG over fragile lookups.
-        for emp in EMPLOYEES:
-            if text_l in emp.get("name", "").lower().split():
-                 return text_l # Return the input as the guessed name
+    # Last resort: single capitalized word (if query is very short)
+    if len(text.split()) <= 3:
+        single_cap = re.findall(r"\b([A-Z][a-z]{2,})\b", text)
+        if single_cap:
+            return single_cap[0]
     
     return None
 
@@ -245,12 +274,14 @@ def format_employee_info(emp: Dict) -> str:
     )
 
 # ============================================================================
-# KNOWLEDGE BASE SEARCH (FAISS)
+# KNOWLEDGE BASE SEARCH (FAISS) - FULLY FIXED VERSION
 # ============================================================================
 def search_knowledge_base(query: str, top_k: int = 3) -> tuple:
     """
     Search FAISS knowledge base for relevant context.
     Returns: (context_text, relevance_score)
+    
+    ✅ FIX: More permissive threshold and better result handling
     """
     # Get resources via lazy loader
     index, texts, embedding_model = get_faiss_resources() 
@@ -267,21 +298,28 @@ def search_knowledge_base(query: str, top_k: int = 3) -> tuple:
     
     # Extract results
     results = []
-    # CRITICAL FIX CHECK: Only add results that meet the minimum RAG threshold
+    
+    # ✅ FIX: Collect ALL results first, then filter
     for rank, i in enumerate(I[0]):
         score = float(D[0][rank])
-        if i < len(texts) and score >= RAG_THRESHOLD:
+        if i < len(texts) and score >= MIN_RAG_SCORE:  # Very permissive minimum
             results.append((str(texts[i]), score))
     
     if not results:
-        # Return None if no chunks meet the threshold
+        print("📚 RAG: No results found above minimum threshold")
         return None, 0.0
     
-    # Combine context
-    context = "\n\n".join([r[0] for r in results])
-    score = results[0][1] # Highest score is the first one
+    # Sort by score (highest first)
+    results.sort(key=lambda x: x[1], reverse=True)
     
-    return context, score
+    # Combine context from top results (max 2 chunks)
+    context_chunks = [r[0] for r in results[:2]]
+    context = "\n\n".join(context_chunks)
+    top_score = results[0][1]
+    
+    print(f"📚 RAG Search: Top score = {top_score:.3f}, Chunks used = {len(context_chunks)}")
+    
+    return context, top_score
 
 # ============================================================================
 # OLLAMA LLM CALLS
@@ -347,6 +385,7 @@ def handle_hr_query(
 ) -> str:
     """
     Main function to handle HR queries with session awareness.
+    ✅ FULLY FIXED: Proper intent classification and RAG handling
     """
     chat_history = chat_history or []
     user_input = (user_input or "").strip()
@@ -388,7 +427,6 @@ def handle_hr_query(
         # If intent is lookup but no name was extracted, proceed to RAG (Step 5)
     
     # STEP 5: Search Knowledge Base
-    # Query is used here for RAG search
     context, score = search_knowledge_base(user_input)
     print(f"📚 Knowledge base search score: {score:.3f}")
     
@@ -400,10 +438,16 @@ def handle_hr_query(
         "office_logistics"
     ]
     
-    # CRITICAL FIX: The check now relies on the RAG_THRESHOLD applied in search_knowledge_base
-    if requires_context and not context:
-        print("⚠️ No context found (or score too low) for policy question")
-        return "⚠️ I couldn't find that in HR policies. Please contact HR at people@acmeai.tech for details."
+    # ✅ FIX: More nuanced context validation
+    if requires_context:
+        if not context:
+            print("⚠️ No context found for policy question")
+            return "⚠️ I couldn't find that in HR policies. Please contact HR at people@acmeai.tech for details."
+        
+        # ✅ FIX: Warn if score is low but still attempt answer
+        if score < RELIABLE_SCORE:
+            print(f"⚠️ Low confidence score: {score:.3f} (threshold: {RELIABLE_SCORE})")
+            # Still proceed but with caveat in system prompt
     
     # STEP 7: Build Messages for LLM
     messages_for_llm = []
@@ -416,22 +460,18 @@ def handle_hr_query(
     
     # Prepend context to current message if available
     if context:
-        # Only prepend context if a relevant chunk was found (i.e., passed RAG_THRESHOLD)
         rag_prefix = f"Context from HR Knowledge Base:\n{context}\n\n"
         current_user_message = rag_prefix + current_user_message
     
     # Add current message
     messages_for_llm.append({"role": "user", "content": current_user_message})
     
-    # Add instruction for concise responses
-    # This will be overridden by the specialized system prompt, but is a safe guard
-    messages_for_llm.append({
-        "role": "user",
-        "content": "Please answer concisely. Do not invent facts."
-    })
-    
     # STEP 8: Get System Prompt from prompt_config
     system_prompt = prompt_config.get_system_prompt(language=lang, context_type=intent)
+    
+    # ✅ FIX: Add warning for low-confidence answers
+    if context and score < RELIABLE_SCORE:
+        system_prompt += f"\n\n⚠️ IMPORTANT: The retrieved context has a lower confidence score ({score:.2f}). If you're not confident in your answer, recommend contacting HR."
     
     # STEP 9: Call LLM
     print("🤖 Calling Ollama LLM...")
@@ -457,7 +497,9 @@ if __name__ == "__main__":
     print("  - hello")
     print("  - who are you")
     print("  - what is the leave policy")
-    print("  - how are you (NEW)") 
+    print("  - what is the company goal for the next two years")
+    print("  - how are you")
+    print("  - who is Omar Faruk")
     print("  - exit (to quit)")
     print("="*70 + "\n")
     
