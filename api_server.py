@@ -1,19 +1,18 @@
-# api_server.py - HR Chatbot API Server
+# api_server.py - HR Chatbot API Server with Session Management
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import backend
-import os, json, hashlib, secrets
+import os, json, hashlib, secrets, uuid
 from datetime import datetime, timedelta
 import threading 
-from apscheduler.schedulers.background import BackgroundScheduler # Requires: pip install apscheduler
-import asyncio # CRITICAL: For running synchronous backend code correctly
+from apscheduler.schedulers.background import BackgroundScheduler
+import asyncio
 
 app = FastAPI(title="HR Chatbot API")
 
 # Configure CORS
-# WARNING: Allow_origins=["*"] is insecure for production. Change to your specific domain(s).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -47,6 +46,7 @@ class ChatRequest(BaseModel):
     message: str
     chat_history: Optional[List[Message]] = []
     session_token: Optional[str] = None
+    is_new_session: Optional[bool] = False  # New field for session management
 
 # --- Data Files ---
 USERS_FILE = "data/users.json"
@@ -72,6 +72,10 @@ def hash_password(password: str) -> str:
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return hash_password(plain_password) == hashed_password
+
+def generate_session_id() -> str:
+    """Generate a unique session ID for new conversations"""
+    return str(uuid.uuid4())
 
 # --- User Management (Protected with Locks) ---
 def load_users():
@@ -117,7 +121,7 @@ def verify_session(token: str) -> Optional[str]:
 # --- In-Memory Short-Term Context Cache (Protected with Lock) ---
 SESSION_CONTEXTS = {}
 CONTEXT_EXPIRY_MINUTES = 10
-MAX_CONTEXT_MESSAGES = 3
+MAX_CONTEXT_MESSAGES = 8
 
 def update_session_context(session_id: str, role: str, message: str):
     """Stores short-term conversational context per session."""
@@ -152,6 +156,13 @@ def cleanup_expired_contexts():
         for sid in expired:
             if sid in SESSION_CONTEXTS: 
                 del SESSION_CONTEXTS[sid]
+
+def clear_session_context(session_id: str):
+    """Clear context for a specific session"""
+    with CONTEXT_LOCK:
+        if session_id in SESSION_CONTEXTS:
+            del SESSION_CONTEXTS[session_id]
+            print(f"🧹 Cleared context for session: {session_id}")
 
 # Start background cleanup job (Runs on startup)
 scheduler = BackgroundScheduler()
@@ -226,13 +237,22 @@ def root():
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     try:
-        session_id = request.session_token or "anon"
+        # Handle new session creation
+        if request.is_new_session or not request.session_token:
+            session_id = generate_session_id()
+            print(f"🆕 Created new session: {session_id}")
+        else:
+            session_id = request.session_token
+        
+        # Clear context for new sessions
+        if request.is_new_session:
+            clear_session_context(session_id)
 
-        # Load previous short-term context
-        recent_context = get_recent_context(session_id)
+        # Load previous short-term context (empty for new sessions)
+        recent_context = [] if request.is_new_session else get_recent_context(session_id)
         combined_history = recent_context + [{"role": "user", "content": request.message}]
 
-        # Generate reply - Use asyncio.to_thread for synchronous backend calls
+        # Generate reply
         reply = await asyncio.to_thread(
             backend.ask_hr_bot, 
             user_input=request.message, 
@@ -240,15 +260,31 @@ async def chat_endpoint(request: ChatRequest):
             session_id=session_id
         )
 
-        # Store this exchange for next query
-        update_session_context(session_id, "user", request.message)
-        update_session_context(session_id, "assistant", reply)
+        # Store this exchange for next query (only if not a new session)
+        if not request.is_new_session:
+            update_session_context(session_id, "user", request.message)
+            update_session_context(session_id, "assistant", reply)
 
-        return {"response": reply, "context": combined_history[-MAX_CONTEXT_MESSAGES:]}
+        return {
+            "response": reply, 
+            "session_token": session_id,
+            "is_new_session": False  # Always return False after first message
+        }
     except Exception as e:
         print("❌ Chat Error:", e)
-        # Re-raise as HTTPException so the client receives a proper error status
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/new-session")
+async def create_new_session():
+    """Explicitly create a new session"""
+    session_id = generate_session_id()
+    clear_session_context(session_id)
+    print(f"🆕 Created explicit new session: {session_id}")
+    return {
+        "status": "success", 
+        "session_token": session_id,
+        "message": "New session created"
+    }
 
 @app.get("/health")
 def health():
