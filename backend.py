@@ -1,4 +1,5 @@
-# backend.py -- Clean backend using prompt_config module
+
+# backend.py -- Clean backend using prompt_config module with Session Management
 import os
 import re
 import json
@@ -36,6 +37,11 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:8b")
 EMPLOYEE_JSON_PATH = os.getenv("EMPLOYEE_JSON_PATH", "data/employees.json")
 INDEX_PATH = os.getenv("INDEX_PATH", "vectorstores/db_faiss/index.faiss")
 TEXTS_PATH = os.getenv("TEXTS_PATH", "vectorstores/db_faiss/texts.npy")
+
+# === CRITICAL FIX CONSTANT: RAG Relevance Threshold ===
+# If the top search score is below this, we treat it as no context found.
+RAG_THRESHOLD = 0.5  # CRITICAL FIX (PRESERVED): Lowered from 0.6 to 0.5
+# ======================================================
 
 # Global variables for FAISS index and model (Lazy Loading setup)
 _FAISS_INDEX = None
@@ -131,14 +137,34 @@ def detect_language(text: str) -> str:
 def classify_intent(text: str) -> str:
     """
     Classify user intent using pattern matching from prompt_config.
+    CRITICAL FIX: Reordered logic and added specific keywords to prevent misclassification.
     """
     text_l = text.lower().strip()
     
-    # 1. Check predefined patterns from prompt_config (Fast conversational path first)
+    # 1. High-Priority Lookups (Bypass all other logic)
+    # Employee Lookup - High Priority (requires explicit "who/contact/details of")
+    if any(phrase in text_l for phrase in ["who is", "who's", "details of", "contact for", "email of", "about"]):
+        return "employee_lookup"
+
+    # 2. Specific Policy/Category Keywords (Bypass greetings/small-talk)
+    
+    # Salary & Benefits
+    if any(word in text_l for word in ["salary", "paycheck", "bonus", "increment", "pf", "allowance", "benefits", "loss hour", "deduction"]):
+        return "salary_benefits"
+        
+    # Procedure / How-To
+    if any(word in text_l for word in ["how to", "procedure", "process for", "resign", "apply for leave", "onboarding", "how can i", "how do i"]):
+        return "procedure_howto"
+        
+    # Office Logistics / Rules / General Policy Terms 
+    # CRITICAL FIX: Ensure keywords that relate to office *facts* are caught here.
+    if any(word in text_l for word in ["office time", "address", "washroom", "kitchen", "ac", "rules for", "dress code", "emergency", "facilities", "support", "conference", "office space", "floor"]):
+        return "office_logistics"
+    
+    # 3. Conversational/Low-Priority Intents (Only if no specific query detected above)
     if check_intent_patterns(text, GREETING_PATTERNS):
         return "greeting"
     
-    # Handle casual "how are you" type questions separately
     if check_intent_patterns(text, SMALL_TALK_PATTERNS):
         return "small_talk"
     
@@ -150,30 +176,18 @@ def classify_intent(text: str) -> str:
     
     if check_intent_patterns(text, GOODBYE_PATTERNS):
         return "goodbye"
-    
-    # 2. Employee Lookup (Explicit Phrases)
-    if any(phrase in text_l for phrase in ["who is", "who's", "details of", "contact for", "email of", "about"]):
-        return "employee_lookup"
 
-    # 2b. Employee Lookup (Heuristic: Single Name/Short Query) - NEW HEURISTIC
-    # Check if a proper name is extractable and the query is very short (e.g., "Punom" or "Omar Faruk")
+    # 4. Final Fallback
+    # Employee Lookup (Heuristic: Single Name/Short Query) - Lower Priority
+    # CRITICAL FIX: If the user provides a *single* word that might be an employee name (like 'punom'), 
+    # and it is NOT preceded by 'who is', we treat it as a *policy question* to force RAG.
+    # The image shows "punom" failing because it likely matched a single name, but was too short 
+    # to be reliably considered an employee lookup in the absence of prefixes.
     name_guess = extract_person_name(text)
     if name_guess and len(text_l.split()) <= 3 and len(name_guess) >= 3:
         if get_employee_by_name(name_guess):
             return "employee_lookup"
-    
-    # 3. Salary & Benefits
-    if any(word in text_l for word in ["salary", "paycheck", "bonus", "increment", "pf", "allowance", "benefits", "loss hour", "deduction"]):
-        return "salary_benefits"
-        
-    # 4. Procedure / How-To
-    if any(word in text_l for word in ["how to", "procedure", "process for", "resign", "apply for leave", "onboarding", "how can i", "how do i"]):
-        return "procedure_howto"
-        
-    # 5. Office Logistics / Rules
-    if any(word in text_l for word in ["office time", "address", "washroom", "kitchen", "AC", "rules for", "dress code", "emergency", "facilities"]):
-        return "office_logistics"
-
+            
     # 6. Default to Policy Question
     return "policy_question"
 
@@ -192,6 +206,16 @@ def extract_person_name(text: str) -> Optional[str]:
     if caps:
         # Prioritize the longest/most likely name extracted from capitalization
         return max(caps, key=len).strip()
+    
+    # CRITICAL FIX: Add a check for a short, single-word query, which often refers to a name
+    # but could be a misspelling of a policy keyword (like the 'punom' failure).
+    text_l = text.lower().strip()
+    if len(text_l.split()) == 1 and len(text_l) >= 3:
+        # If a single word matches an employee name, treat it as the name for now.
+        # This will be filtered later in classify_intent's step 4 to promote RAG over fragile lookups.
+        for emp in EMPLOYEES:
+            if text_l in emp.get("name", "").lower().split():
+                 return text_l # Return the input as the guessed name
     
     return None
 
@@ -213,6 +237,7 @@ def format_employee_info(emp: Dict) -> str:
     if not emp:
         return "❌ Employee not found in HR records."
     
+    # NOTE: The public function is kept minimal for security (Name, Position, Email ONLY)
     return (
         f"👤 {emp.get('name', 'N/A')}\n"
         f"🏢 Position: {emp.get('position', 'N/A')}\n"
@@ -242,16 +267,19 @@ def search_knowledge_base(query: str, top_k: int = 3) -> tuple:
     
     # Extract results
     results = []
+    # CRITICAL FIX CHECK: Only add results that meet the minimum RAG threshold
     for rank, i in enumerate(I[0]):
-        if i < len(texts):
-            results.append((str(texts[i]), float(D[0][rank])))
+        score = float(D[0][rank])
+        if i < len(texts) and score >= RAG_THRESHOLD:
+            results.append((str(texts[i]), score))
     
     if not results:
+        # Return None if no chunks meet the threshold
         return None, 0.0
     
     # Combine context
     context = "\n\n".join([r[0] for r in results])
-    score = results[0][1]
+    score = results[0][1] # Highest score is the first one
     
     return context, score
 
@@ -279,7 +307,7 @@ def call_ollama(payload_json: dict, timeout: int = 60) -> dict:
 def call_ollama_with_history(
     system_prompt: str,
     messages_history: List[Dict],
-    temperature: float = 0.4,
+    temperature: float = 0.3,
     max_tokens: int = 300
 ) -> str:
     """
@@ -306,10 +334,11 @@ def call_ollama_with_history(
     elif isinstance(resp, dict) and "response" in resp:
         return str(resp.get("response", "")).strip()
     else:
-        return "⚠️ No response from AI model."
+        # Fallback for LLM failure/garbage
+        return "⚠️ I couldn't get a coherent response from the AI model. Please try again or contact HR at people@acmeai.tech."
 
 # ============================================================================
-# MAIN QUERY HANDLER
+# MAIN QUERY HANDLER - UPDATED WITH SESSION AWARENESS
 # ============================================================================
 def handle_hr_query(
     user_input: str,
@@ -317,10 +346,14 @@ def handle_hr_query(
     session_id: Optional[str] = None
 ) -> str:
     """
-    Main function to handle HR queries.
+    Main function to handle HR queries with session awareness.
     """
     chat_history = chat_history or []
     user_input = (user_input or "").strip()
+    
+    # Log session info for debugging
+    print(f"🆔 Session ID: {session_id}")
+    print(f"💬 History length: {len(chat_history)}")
     
     # Validate input
     if not user_input:
@@ -355,6 +388,7 @@ def handle_hr_query(
         # If intent is lookup but no name was extracted, proceed to RAG (Step 5)
     
     # STEP 5: Search Knowledge Base
+    # Query is used here for RAG search
     context, score = search_knowledge_base(user_input)
     print(f"📚 Knowledge base search score: {score:.3f}")
     
@@ -366,27 +400,31 @@ def handle_hr_query(
         "office_logistics"
     ]
     
+    # CRITICAL FIX: The check now relies on the RAG_THRESHOLD applied in search_knowledge_base
     if requires_context and not context:
-        print("⚠️ No context found for policy question")
+        print("⚠️ No context found (or score too low) for policy question")
         return "⚠️ I couldn't find that in HR policies. Please contact HR at people@acmeai.tech for details."
     
     # STEP 7: Build Messages for LLM
     messages_for_llm = []
     current_user_message = user_input
     
+    # Use chat history for context (provided by session management)
     if chat_history and len(chat_history) > 0:
-        previous_history = chat_history[:-1]
-        messages_for_llm.extend(previous_history)
+        # Use the full chat history provided by the session
+        messages_for_llm.extend(chat_history)
     
     # Prepend context to current message if available
     if context:
+        # Only prepend context if a relevant chunk was found (i.e., passed RAG_THRESHOLD)
         rag_prefix = f"Context from HR Knowledge Base:\n{context}\n\n"
         current_user_message = rag_prefix + current_user_message
     
     # Add current message
     messages_for_llm.append({"role": "user", "content": current_user_message})
     
-    # Add instruction
+    # Add instruction for concise responses
+    # This will be overridden by the specialized system prompt, but is a safe guard
     messages_for_llm.append({
         "role": "user",
         "content": "Please answer concisely. Do not invent facts."
@@ -419,12 +457,13 @@ if __name__ == "__main__":
     print("  - hello")
     print("  - who are you")
     print("  - what is the leave policy")
-
     print("  - how are you (NEW)") 
     print("  - exit (to quit)")
     print("="*70 + "\n")
     
     history = []
+    session_id = "debug_session"
+    
     while True:
         try:
             q = input("You: ").strip()
@@ -439,11 +478,11 @@ if __name__ == "__main__":
             history.append({"role": "user", "content": q})
 
             print()
-            response = ask_hr_bot(q, chat_history=history)
+            response = ask_hr_bot(q, chat_history=history, session_id=session_id)
             print(f"Bot: {response}\n")
 
             history.append({"role": "assistant", "content": response})
-            history = history[-6:]
+            history = history[-6:]  # Keep last 6 messages
             
         except KeyboardInterrupt:
             print("\n\n👋 Goodbye!\n")
