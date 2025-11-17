@@ -1,21 +1,59 @@
-# api_server.py - HR Chatbot API Server with Session Management
-from fastapi import FastAPI, HTTPException
+# api_server.py - ULTRA-FAST HR Chatbot API Server with Multi-threading
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
+from collections import OrderedDict
 import backend
-import os, json, hashlib, secrets, uuid
+import os
+import json
+import hashlib
+import secrets
 from datetime import datetime, timedelta
-import threading 
-from apscheduler.schedulers.background import BackgroundScheduler
+import threading
+import time
+from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 import asyncio
 
-app = FastAPI(title="HR Chatbot API")
+# --- PERFORMANCE: Thread pool for parallel processing ---
+THREAD_POOL = ThreadPoolExecutor(max_workers=10)
 
-# Configure CORS
+# --- STARTUP/SHUTDOWN LIFECYCLE ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("\n" + "="*70)
+    print("🚀 STARTING ULTRA-FAST HR CHATBOT API SERVER")
+    print("="*70)
+    
+    print("📚 Preloading FAISS knowledge base...")
+    start = time.time()
+    backend.load_faiss_index()
+    elapsed = time.time() - start
+    print(f"✅ FAISS loaded in {elapsed:.2f}s")
+    
+    cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
+    cleanup_thread.start()
+    print("🧹 Background session cleanup started")
+    
+    print("="*70)
+    print("✅ SERVER READY - ULTRA-FAST MODE")
+    print("="*70 + "\n")
+    
+    yield
+    
+    print("\n🛑 Shutting down gracefully...")
+    THREAD_POOL.shutdown(wait=True)
+
+app = FastAPI(
+    title="HR Chatbot API - Ultra-Fast",
+    version="3.0-FAST",
+    lifespan=lifespan
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -25,7 +63,6 @@ app.add_middleware(
 USER_LOCK = threading.Lock()
 SESSION_LOCK = threading.Lock()
 CONTEXT_LOCK = threading.Lock()
-# --------------------------
 
 # --- User Models ---
 class UserRegister(BaseModel):
@@ -46,11 +83,13 @@ class ChatRequest(BaseModel):
     message: str
     chat_history: Optional[List[Message]] = []
     session_token: Optional[str] = None
-    is_new_session: Optional[bool] = False  # New field for session management
 
-# --- Data Files ---
+# --- DATA & CACHE ---
 USERS_FILE = "data/users.json"
 SESSIONS_FILE = "data/sessions.json"
+USER_CACHE = {}
+SESSION_CACHE = {}
+CACHE_EXPIRY = 300
 
 # --- Utility Functions ---
 def load_json(path, default):
@@ -65,7 +104,7 @@ def load_json(path, default):
 def save_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
@@ -73,30 +112,38 @@ def hash_password(password: str) -> str:
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return hash_password(plain_password) == hashed_password
 
-def generate_session_id() -> str:
-    """Generate a unique session ID for new conversations"""
-    return str(uuid.uuid4())
-
-# --- User Management (Protected with Locks) ---
+# --- OPTIMIZED: User Management with Caching ---
 def load_users():
-    with USER_LOCK: 
-        return load_json(USERS_FILE, [])
+    global USER_CACHE
+    if USER_CACHE:
+        return USER_CACHE
+    with USER_LOCK:
+        USER_CACHE = load_json(USERS_FILE, [])
+        return USER_CACHE
 
 def save_users(users):
-    with USER_LOCK: 
+    global USER_CACHE
+    USER_CACHE = users
+    with USER_LOCK:
         save_json(USERS_FILE, users)
 
-def load_sessions(): 
-    with SESSION_LOCK: 
-        return load_json(SESSIONS_FILE, {})
+def load_sessions():
+    global SESSION_CACHE
+    if SESSION_CACHE:
+        return SESSION_CACHE
+    with SESSION_LOCK:
+        SESSION_CACHE = load_json(SESSIONS_FILE, {})
+        return SESSION_CACHE
 
 def save_sessions(sessions):
-    with SESSION_LOCK: 
+    global SESSION_CACHE
+    SESSION_CACHE = sessions
+    with SESSION_LOCK:
         save_json(SESSIONS_FILE, sessions)
 
 def create_session(user_id: str) -> str:
     sessions = load_sessions()
-    token = secrets.token_hex(32)
+    token = secrets.token_hex(16)
     sessions[token] = {
         "user_id": user_id,
         "created_at": datetime.now().isoformat(),
@@ -111,65 +158,69 @@ def verify_session(token: str) -> Optional[str]:
         return None
     session = sessions[token]
     if datetime.now() > datetime.fromisoformat(session["expires_at"]):
-        with SESSION_LOCK: 
-            if token in sessions:
-                del sessions[token]
-                save_sessions(sessions)
+        with SESSION_LOCK:
+            del sessions[token]
+            save_sessions(sessions)
         return None
     return session["user_id"]
 
-# --- In-Memory Short-Term Context Cache (Protected with Lock) ---
-SESSION_CONTEXTS = {}
-CONTEXT_EXPIRY_MINUTES = 10
-MAX_CONTEXT_MESSAGES = 8
+# --- ULTRA-OPTIMIZED: In-Memory Context with Fast Access (Multi-User Safety) ---
+SESSION_CONTEXTS = OrderedDict()
+MAX_SESSIONS = 200
+MAX_CONTEXT_MESSAGES = 4  # Kept low for speed
+CONTEXT_EXPIRY_MINUTES = 30
 
 def update_session_context(session_id: str, role: str, message: str):
-    """Stores short-term conversational context per session."""
+    """Lightning-fast session context update, thread-safe."""
     now = datetime.now()
-    with CONTEXT_LOCK: 
+    
+    with CONTEXT_LOCK:
         if session_id not in SESSION_CONTEXTS:
-            SESSION_CONTEXTS[session_id] = {"messages": [], "last_active": now}
+            SESSION_CONTEXTS[session_id] = {
+                "messages": [],
+                "last_active": now
+            }
+        
         ctx = SESSION_CONTEXTS[session_id]
         ctx["messages"].append({"role": role, "content": message})
-        ctx["messages"] = ctx["messages"][-MAX_CONTEXT_MESSAGES:]  
+        ctx["messages"] = ctx["messages"][-MAX_CONTEXT_MESSAGES:]
         ctx["last_active"] = now
+        SESSION_CONTEXTS.move_to_end(session_id)
+        
+        if len(SESSION_CONTEXTS) > MAX_SESSIONS:
+            SESSION_CONTEXTS.popitem(last=False)
 
-def get_recent_context(session_id: str):
-    """Return recent messages if session still active."""
-    with CONTEXT_LOCK: 
+def get_recent_context(session_id: str) -> List[dict]:
+    """Fast context retrieval, thread-safe."""
+    with CONTEXT_LOCK:
         ctx = SESSION_CONTEXTS.get(session_id)
         if not ctx:
             return []
+        
         if datetime.now() - ctx["last_active"] > timedelta(minutes=CONTEXT_EXPIRY_MINUTES):
             del SESSION_CONTEXTS[session_id]
             return []
+        
         return ctx["messages"]
 
-def cleanup_expired_contexts(): 
-    """Remove expired session contexts to prevent memory leak"""
+def cleanup_expired_sessions():
+    """Fast cleanup"""
     now = datetime.now()
     with CONTEXT_LOCK:
         expired = [
-            sid for sid, ctx in SESSION_CONTEXTS.items()
+            sid for sid, ctx in list(SESSION_CONTEXTS.items())
             if now - ctx["last_active"] > timedelta(minutes=CONTEXT_EXPIRY_MINUTES)
         ]
         for sid in expired:
-            if sid in SESSION_CONTEXTS: 
-                del SESSION_CONTEXTS[sid]
+            del SESSION_CONTEXTS[sid]
 
-def clear_session_context(session_id: str):
-    """Clear context for a specific session"""
-    with CONTEXT_LOCK:
-        if session_id in SESSION_CONTEXTS:
-            del SESSION_CONTEXTS[session_id]
-            print(f"🧹 Cleared context for session: {session_id}")
+def periodic_cleanup():
+    """Background cleanup task"""
+    while True:
+        time.sleep(600)
+        cleanup_expired_sessions()
 
-# Start background cleanup job (Runs on startup)
-scheduler = BackgroundScheduler()
-scheduler.add_job(cleanup_expired_contexts, 'interval', minutes=CONTEXT_EXPIRY_MINUTES)
-scheduler.start()
-
-# --- Authentication Endpoints ---
+# --- Authentication Endpoints (Kept minimal for core API function) ---
 @app.post("/register")
 async def register(user_data: UserRegister):
     users = load_users()
@@ -177,9 +228,8 @@ async def register(user_data: UserRegister):
         raise HTTPException(status_code=400, detail="Username already exists")
     if any(u["email"] == user_data.email for u in users):
         raise HTTPException(status_code=400, detail="Email already registered")
-
     new_user = {
-        "id": secrets.token_hex(16),
+        "id": secrets.token_hex(8),
         "username": user_data.username,
         "email": user_data.email,
         "password_hash": hash_password(user_data.password),
@@ -197,22 +247,15 @@ async def login(login_data: UserLogin):
     user = next((u for u in users if u["username"] == login_data.username and u["is_active"]), None)
     if not user or not verify_password(login_data.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid username or password")
-
     token = create_session(user["id"])
-    return {
-        "status": "success",
-        "message": "Login successful",
-        "token": token,
-        "user": {"id": user["id"], "username": user["username"], "email": user["email"], "employee_id": user.get("employee_id")}
-    }
+    return {"status": "success", "message": "Login successful", "token": token, "user": {"id": user["id"], "username": user["username"]}}
 
 @app.post("/logout")
 async def logout(token: str):
     sessions = load_sessions()
-    with SESSION_LOCK: 
-        if token in sessions:
-            del sessions[token]
-            save_sessions(sessions)
+    if token in sessions:
+        del sessions[token]
+        save_sessions(sessions)
     return {"status": "success", "message": "Logout successful"}
 
 @app.get("/verify-session")
@@ -224,68 +267,58 @@ async def verify_session_endpoint(token: str):
     user = next((u for u in users if u["id"] == user_id), None)
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
-    return {
-        "status": "success",
-        "user": {"id": user["id"], "username": user["username"], "email": user["email"], "employee_id": user.get("employee_id")}
-    }
+    return {"status": "success", "user": {"id": user["id"], "username": user["username"]}}
 
-# --- Chat Endpoints ---
-@app.get("/")
-def root():
-    return {"status": "HR Chatbot API Running"}
-
+# --- ULTRA-FAST: Async Chat Endpoint ---
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
+    start_time = time.time()
+    
     try:
-        # Handle new session creation
-        if request.is_new_session or not request.session_token:
-            session_id = generate_session_id()
-            print(f"🆕 Created new session: {session_id}")
-        else:
-            session_id = request.session_token
+        session_id = request.session_token or "anon"
+        # Get context specific to this user/session
+        recent_context = get_recent_context(session_id)
         
-        # Clear context for new sessions
-        if request.is_new_session:
-            clear_session_context(session_id)
-
-        # Load previous short-term context (empty for new sessions)
-        recent_context = [] if request.is_new_session else get_recent_context(session_id)
-        combined_history = recent_context + [{"role": "user", "content": request.message}]
-
-        # Generate reply
-        reply = await asyncio.to_thread(
-            backend.ask_hr_bot, 
-            user_input=request.message, 
-            chat_history=combined_history, 
-            session_id=session_id
+        # Prepare history with minimal overhead
+        combined_history = recent_context if recent_context else [
+            {"role": msg.role, "content": msg.content} 
+            for msg in (request.chat_history or [])
+        ]
+        
+        # Run backend query in thread pool for true async
+        loop = asyncio.get_event_loop()
+        reply = await loop.run_in_executor(
+            THREAD_POOL,
+            backend.ask_hr_bot,
+            request.message,
+            combined_history,
+            session_id
         )
-
-        # Store this exchange for next query (only if not a new session)
-        if not request.is_new_session:
-            update_session_context(session_id, "user", request.message)
-            update_session_context(session_id, "assistant", reply)
-
+        
+        # Store context asynchronously for THIS session_id
+        update_session_context(session_id, "user", request.message)
+        update_session_context(session_id, "assistant", reply)
+        
+        elapsed = time.time() - start_time
+        
+        print(f"⚡ Chat response in {elapsed:.3f}s | Session: {session_id[:8]}...")
+        
         return {
-            "response": reply, 
-            "session_token": session_id,
-            "is_new_session": False  # Always return False after first message
+            "response": reply,
+            "response_time": round(elapsed, 3),
+            "session_id": session_id
         }
+        
     except Exception as e:
-        print("❌ Chat Error:", e)
+        elapsed = time.time() - start_time
+        print(f"❌ Chat error after {elapsed:.3f}s: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/new-session")
-async def create_new_session():
-    """Explicitly create a new session"""
-    session_id = generate_session_id()
-    clear_session_context(session_id)
-    print(f"🆕 Created explicit new session: {session_id}")
-    return {
-        "status": "success", 
-        "session_token": session_id,
-        "message": "New session created"
-    }
+# --- Health & Status ---
+@app.get("/")
+def root():
+    return {"status": "HR Chatbot API Running - ULTRA-FAST MODE", "version": "3.0-FAST", "active_sessions": len(SESSION_CONTEXTS)}
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "mode": "ultra-fast", "active_sessions": len(SESSION_CONTEXTS), "thread_pool_workers": 10}
